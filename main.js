@@ -1,4 +1,4 @@
-// ========== KAMAONOW USER APP ==========
+// ========== KAMAONOW USER APP WITH SETTINGS ==========
 console.log("🚀 KamaoNow Loading...");
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.0/firebase-app.js";
@@ -34,6 +34,48 @@ let currentUser = null;
 let selectedMethod = null;
 let currentFilter = 'all';
 let allWithdrawals = [];
+
+// ========== APP SETTINGS (FROM ADMIN) ==========
+let appSettings = {
+    minWithdrawal: 200,
+    dailyTaskLimit: 20,
+    referralCommission: 15,
+    welcomeBonus: 100
+};
+
+async function loadSettings() {
+    try {
+        const settingsRef = doc(db, 'settings', 'app');
+        const settingsSnap = await getDoc(settingsRef);
+        
+        if (settingsSnap.exists()) {
+            const data = settingsSnap.data();
+            appSettings.minWithdrawal = data.minWithdrawal || 200;
+            appSettings.dailyTaskLimit = data.dailyTaskLimit || 20;
+            appSettings.referralCommission = data.referralCommission || 15;
+            appSettings.welcomeBonus = data.welcomeBonus || 100;
+        }
+        console.log("✅ Settings loaded:", appSettings);
+        
+        // 🔥 UPDATE WITHDRAW PAGE MIN AMOUNT DISPLAY
+        updateWithdrawPageSettings();
+    } catch (error) {
+        console.error("Error loading settings:", error);
+    }
+}
+
+// 🔥 NEW FUNCTION: Update withdraw page with current settings
+function updateWithdrawPageSettings() {
+    const minWithdrawLabel = document.querySelector('.withdraw-input label');
+    if (minWithdrawLabel) {
+        minWithdrawLabel.innerHTML = `Amount (Min ₨${appSettings.minWithdrawal})`;
+    }
+    const withdrawAmountInput = document.getElementById('withdrawAmount');
+    if (withdrawAmountInput) {
+        withdrawAmountInput.placeholder = `Min ₨${appSettings.minWithdrawal}`;
+        withdrawAmountInput.min = appSettings.minWithdrawal;
+    }
+}
 
 let appData = {
     balance: 0,
@@ -159,31 +201,60 @@ window.completeTask = async function(taskId, taskName, reward) {
     hideLoading();
 };
 
+// ========== WITHDRAWAL REQUEST WITH BALANCE DEDUCTION ==========
 window.requestWithdrawal = async function() {
     if (!currentUser) { showToast("Please login first!", "error"); return; }
+    
     const amount = parseInt(document.getElementById('withdrawAmount')?.value);
     const account = document.getElementById('accountNumber')?.value;
     const method = selectedMethod;
+    
     if (!method) { showToast("Select method!", "error"); return; }
-    if (!amount || amount < 200) { showToast("Minimum ₨200!", "error"); return; }
+    if (!amount || amount < appSettings.minWithdrawal) { 
+        showToast(`Minimum withdrawal is ₨${appSettings.minWithdrawal}!`, "error"); 
+        return; 
+    }
     if (!account) { showToast("Enter account!", "error"); return; }
     if (amount > appData.balance) { showToast("Insufficient balance!", "error"); return; }
     
     showLoading("Submitting...");
     try {
         let methodDisplay = method === 'jazzcash' ? "JazzCash" : method === 'easypaisa' ? "EasyPaisa" : "UPaisa";
+        
+        // 🔥 SAVE WITHDRAWAL REQUEST
         await addDoc(collection(db, 'withdrawal_requests'), {
             userId: currentUser.userId, userName: currentUser.name, amount, method, methodDisplay, accountNumber: account,
             status: 'pending', requestedAt: new Date().toISOString()
         });
-        showToast(`✅ Withdrawal request submitted!`, "success");
-        addActivity(`💰 Requested withdrawal of ₨${amount}`);
+        
+        // 🔥 DEDUCT BALANCE IMMEDIATELY
+        const userRef = doc(db, 'users', currentUser.userId);
+        await updateDoc(userRef, {
+            balance: increment(-amount)
+        });
+        
+        // 🔥 UPDATE LOCAL BALANCE
+        appData.balance -= amount;
+        updateUI();
+        
+        showToast(`✅ Withdrawal request of ₨${amount} submitted! Balance updated.`, "success");
+        addActivity(`💰 Withdrawal request of ₨${amount} submitted. New balance: ₨${appData.balance}`);
+        
+        // Clear form
         document.getElementById('withdrawAmount').value = '';
         document.getElementById('accountNumber').value = '';
         document.querySelectorAll('.method-option').forEach(opt => opt.classList.remove('selected'));
         selectedMethod = null;
-        if (document.getElementById('withdrawHistoryScreen').classList.contains('active')) loadWithdrawalHistory();
-    } catch (error) { showToast("Failed!", "error"); }
+        
+        // Refresh withdrawal history if open
+        if (document.getElementById('withdrawHistoryScreen').classList.contains('active')) {
+            loadWithdrawalHistory();
+        }
+        
+    } catch (error) { 
+        console.error(error);
+        showToast("Failed to submit request!", "error"); 
+    }
     hideLoading();
 };
 
@@ -315,8 +386,12 @@ function updateActivities() {
     container.innerHTML = appData.activities.map(a => `<div class="activity-item"><i class="fas fa-history"></i><div><div>${a.message}</div><small>${a.time}</small></div></div>`).join('');
 }
 
+// ========== LOAD USER DATA WITH SETTINGS ==========
 async function loadUserData(userId) {
     try {
+        // 🔥 LOAD SETTINGS FIRST
+        await loadSettings();
+        
         const userRef = doc(db, 'users', userId);
         const docSnap = await getDoc(userRef);
         if (docSnap.exists()) {
@@ -354,6 +429,7 @@ window.loginUser = async function() {
     hideLoading();
 };
 
+// ========== REGISTER WITH WELCOME BONUS FROM SETTINGS ==========
 window.registerUser = async function() {
     const name = document.getElementById('regName').value;
     const email = document.getElementById('regEmail').value;
@@ -364,15 +440,21 @@ window.registerUser = async function() {
     if (password.length < 6) { showToast("Password must be at least 6 characters!", "error"); return; }
     showLoading("Creating account...");
     try {
+        // Load settings first to get welcome bonus
+        await loadSettings();
+        
         const q = query(collection(db, 'users'), where('email', '==', email));
         const snapshot = await getDocs(q);
         if (!snapshot.empty) { showToast("Email already registered!", "error"); hideLoading(); return; }
         const userId = 'user_' + Date.now();
+        // 🔥 USING appSettings.welcomeBonus
         await setDoc(doc(db, 'users', userId), {
-            userId, name, email, password: btoa(password), balance: 0, completedTasks: [],
+            userId, name, email, password: btoa(password), 
+            balance: appSettings.welcomeBonus, 
+            completedTasks: [],
             referrals: 0, streak: 1, createdAt: new Date().toISOString(), status: 'active'
         });
-        showToast("✅ Registration successful! Please login.", "success");
+        showToast(`✅ Registration successful! Welcome bonus: ₨${appSettings.welcomeBonus}`, "success");
         switchAuthTab('login');
         document.getElementById('regName').value = '';
         document.getElementById('regEmail').value = '';
@@ -395,6 +477,7 @@ window.navigateTo = function(screen) {
     screens.forEach(s => { const el = document.getElementById(`${s}Screen`); if (el) el.classList.remove('active'); });
     document.getElementById(`${screen}Screen`).classList.add('active');
     if (screen === 'withdrawHistory') loadWithdrawalHistory();
+    if (screen === 'withdraw') updateWithdrawPageSettings(); // 🔥 Update withdraw page settings
     const navItems = document.querySelectorAll('.nav-item');
     const map = { home: 0, tasks: 1, earn: 2, withdraw: 3, withdrawHistory: 4, refer: 5 };
     navItems.forEach((item, i) => { if (i === map[screen]) item.classList.add('active'); else item.classList.remove('active'); });
@@ -429,4 +512,4 @@ if (savedUser) {
 }
 
 setInterval(() => { if (currentUser) checkPendingItems(); }, 30000);
-console.log("✅ KamaoNow Ready!");
+console.log("✅ KamaoNow Ready with Settings Support!");
